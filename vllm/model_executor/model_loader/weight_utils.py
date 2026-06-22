@@ -61,10 +61,11 @@ except ImportError:
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
 try:
-    from phxloader import PhxLoader, parse_safetensor_header
+    from phxloader_v1 import PhxLoaderV1, parse_safetensor_header as parse_safetensor_header
 except ImportError:
-    phxloader = PlaceholderModule("phxloader")
-    PhxLoader = phxloader.placeholder_attr("PhxLoader")
+    phxloader_v1 = PlaceholderModule("phxloader_v1")
+    PhxLoaderV1 = phxloader_v1.placeholder_attr("PhxLoaderV1")
+    parse_safetensor_header = phxloader_v1.placeholder_attr("parse_safetensor_header")
 
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
@@ -1028,30 +1029,30 @@ def runai_safetensors_weights_iterator(
 
 
 # ---------------------------------------------------------------------------
-# Phoenix (GPU Direct Storage via phxfs) weight loading
+# Phoenix V1 (GPU Direct Storage via phxfs) weight loading
 # ---------------------------------------------------------------------------
 
-def phoenix_weights_iterator(
+def phoenix_weights_iterator_v1(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
     local_expert_ids: set[int] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
-    using Phoenix GPU Direct Storage (phxfs) DMA.
+    using Phoenix GPU Direct Storage V1 (phxfs) DMA.
 
-    Phase 1: DMA to a staging GPU buffer, then yield zero-copy tensor
+    Version 1: DMA to a staging GPU buffer, then yield zero-copy tensor
     views from the buffer. The consumer (default_weight_loader) will
     copy_ the data into model parameters.
     """
     device = torch.device(f"cuda:{current_platform.current_device()}")
-    loader = PhxLoader(current_platform.current_device())
+    loader = PhxLoaderV1(current_platform.current_device())
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
     try:
         for st_file in tqdm(
             sorted_files,
-            desc="Loading safetensors using Phoenix loader",
+            desc="Loading safetensors using Phoenix V1 loader",
             disable=not enable_tqdm(use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
         ):
@@ -1110,6 +1111,26 @@ def phoenix_weights_iterator(
                 loader.deregmem(buf.data_ptr(), buf.numel())
     finally:
         loader.close()
+
+
+# ---------------------------------------------------------------------------
+# Phoenix V2 (GPU Direct Storage via phxfs) weight loading
+# ---------------------------------------------------------------------------
+
+def phoenix_weights_iterator_v2(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    local_expert_ids: set[int] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files
+    using Phoenix GPU Direct Storage V2 (phxfs) DMA.
+
+    TODO: Implement V2 loading logic.
+    """
+    raise NotImplementedError(
+        "phxsafetensors_v2 is not yet implemented. "
+        "Please implement PhxLoaderV2 and this function."
+    )
 
 
 def _init_fastsafetensors_loader(
