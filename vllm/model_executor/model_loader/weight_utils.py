@@ -60,6 +60,12 @@ except ImportError:
     fastsafetensors = PlaceholderModule("fastsafetensors")
     SingleGroup = fastsafetensors.placeholder_attr("SingleGroup")
 
+try:
+    from phxloader import PhxLoader, parse_safetensor_header
+except ImportError:
+    phxloader = PlaceholderModule("phxloader")
+    PhxLoader = phxloader.placeholder_attr("PhxLoader")
+
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
@@ -1019,6 +1025,104 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             yield name, tensor.clone()
+
+
+# ---------------------------------------------------------------------------
+# Phoenix (GPU Direct Storage via phxfs) weight loading
+# ---------------------------------------------------------------------------
+
+def phoenix_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    local_expert_ids: set[int] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Iterate over the weights in the model safetensor files
+    using Phoenix GPU Direct Storage (phxfs) DMA.
+
+    Phase 1: DMA to a staging GPU buffer, then yield zero-copy tensor
+    views from the buffer. The consumer (default_weight_loader) will
+    copy_ the data into model parameters.
+    """
+    device = torch.device(f"cuda:{current_platform.current_device()}")
+    loader = PhxLoader(current_platform.current_device())
+
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    try:
+        for st_file in tqdm(
+            sorted_files,
+            desc="Loading safetensors using Phoenix loader",
+            disable=not enable_tqdm(use_tqdm_on_load),
+            bar_format=_BAR_FORMAT,
+        ):
+            tensor_meta, header_size = parse_safetensor_header(st_file)
+
+            # Filter out skipped weights (EP) and collect what we need
+            needed: dict[str, tuple[torch.dtype, tuple[int, ...], int, int]] = {}
+            for name, meta in tensor_meta.items():
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                needed[name] = meta
+
+            if not needed:
+                continue
+
+            # Compute total data size to allocate GPU buffer
+            max_end = 0
+            for dtype, shape, start, nbytes in needed.values():
+                end = start + nbytes
+                if end > max_end:
+                    max_end = end
+
+            # Account for pre_padding: header_size may not be 4K-aligned,
+            # so we read from align_down(header_size, 4096) and the data
+            # starts at pre_padding bytes into the buffer.
+            aligned_header = header_size & ~4095  # align_down(header_size, 4K)
+            pre_padding = header_size - aligned_header
+            total_data = pre_padding + max_end
+
+            # Align buffer size up to 64K for phxfs_regmem
+            GPU_PAGE_SIZE = 64 * 1024
+            buf_size = (total_data + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1)
+
+            # Allocate GPU buffer and register with phxfs
+            buf = torch.empty(buf_size, dtype=torch.uint8, device=device)
+            loader.regmem(buf.data_ptr(), buf.numel())
+
+            try:
+                # Single DMA read for the entire data section
+                actual_padding = loader.read_data_section(
+                    st_file, buf.data_ptr(), header_size, max_end)
+                if actual_padding != pre_padding:
+                    raise RuntimeError(
+                        f"Padding mismatch for '{st_file}': "
+                        f"expected {pre_padding}, got {actual_padding}"
+                    )
+
+                # Yield zero-copy tensor views from the buffer
+                # Data starts at buf[pre_padding + start] for each tensor
+                for name, (dtype, shape, start, nbytes) in needed.items():
+                    view = buf[pre_padding + start:
+                               pre_padding + start + nbytes
+                               ].view(dtype).reshape(shape)
+                    yield name, view
+            finally:
+                loader.deregmem(buf.data_ptr(), buf.numel())
+    finally:
+        loader.close()
+
+
+def _init_fastsafetensors_loader(
+    pg: "torch.distributed.ProcessGroup",
+    device: torch.device,
+    f_list: list[str],
+    *,
+    nogds: bool = False,
+):
+    loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+    rank_file_map = {i: [f] for i, f in enumerate(f_list)}
+    loader.add_filenames(rank_file_map)
+    return loader
 
 
 def fastsafetensors_weights_iterator(
