@@ -67,6 +67,21 @@ except ImportError:
     PhxLoaderV1 = phxloader_v1.placeholder_attr("PhxLoaderV1")
     parse_safetensor_header = phxloader_v1.placeholder_attr("parse_safetensor_header")
 
+try:
+    from phxloader_v2 import (
+        PhxLoaderV2,
+        parse_safetensor_header as parse_safetensor_header_v2,
+        build_read_groups,
+        build_file_plan,
+    )
+except ImportError:
+    phxloader_v2 = PlaceholderModule("phxloader_v2")
+    PhxLoaderV2 = phxloader_v2.placeholder_attr("PhxLoaderV2")
+    parse_safetensor_header_v2 = phxloader_v2.placeholder_attr(
+        "parse_safetensor_header")
+    build_read_groups = phxloader_v2.placeholder_attr("build_read_groups")
+    build_file_plan = phxloader_v2.placeholder_attr("build_file_plan")
+
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
@@ -1049,6 +1064,12 @@ def phoenix_weights_iterator_v1(
 
     sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
 
+    t_start = time.perf_counter()
+    t_parse_total = 0.0
+    t_regmem_total = 0.0
+    t_dma_total = 0.0
+    t_deregmem_total = 0.0
+    file_count = 0
     try:
         for st_file in tqdm(
             sorted_files,
@@ -1056,6 +1077,7 @@ def phoenix_weights_iterator_v1(
             disable=not enable_tqdm(use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
         ):
+            t_parse = time.perf_counter()
             tensor_meta, header_size = parse_safetensor_header(st_file)
 
             # Filter out skipped weights (EP) and collect what we need
@@ -1086,14 +1108,22 @@ def phoenix_weights_iterator_v1(
             GPU_PAGE_SIZE = 64 * 1024
             buf_size = (total_data + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1)
 
-            # Allocate GPU buffer and register with phxfs
+            # Allocate GPU buffer
             buf = torch.empty(buf_size, dtype=torch.uint8, device=device)
+            t_parse_total += time.perf_counter() - t_parse
+
+            file_count += 1
+
+            t_reg = time.perf_counter()
             loader.regmem(buf.data_ptr(), buf.numel())
+            t_regmem_total += time.perf_counter() - t_reg
 
             try:
                 # Single DMA read for the entire data section
+                t_dma = time.perf_counter()
                 actual_padding = loader.read_data_section(
                     st_file, buf.data_ptr(), header_size, max_end)
+                t_dma_total += time.perf_counter() - t_dma
                 if actual_padding != pre_padding:
                     raise RuntimeError(
                         f"Padding mismatch for '{st_file}': "
@@ -1108,8 +1138,23 @@ def phoenix_weights_iterator_v1(
                                ].view(dtype).reshape(shape)
                     yield name, view
             finally:
+                t_dereg = time.perf_counter()
                 loader.deregmem(buf.data_ptr(), buf.numel())
+                t_deregmem_total += time.perf_counter() - t_dereg
     finally:
+        t_total = time.perf_counter() - t_start
+        t_yield = (t_total - t_parse_total - t_regmem_total
+                   - t_dma_total - t_deregmem_total)
+        rank = (torch.distributed.get_rank()
+                if torch.distributed.is_initialized() else 0)
+        logger.info(
+            "Phoenix V1 weight loading timing (rank=%d): "
+            "files=%d parse=%.3fs regmem=%.3fs "
+            "dma=%.3fs yield(copy_)=%.3fs "
+            "deregmem=%.3fs total=%.3fs",
+            rank, file_count, t_parse_total, t_regmem_total,
+            t_dma_total, t_yield, t_deregmem_total, t_total,
+        )
         loader.close()
 
 
@@ -1125,12 +1170,130 @@ def phoenix_weights_iterator_v2(
     """Iterate over the weights in the model safetensor files
     using Phoenix GPU Direct Storage V2 (phxfs) DMA.
 
-    TODO: Implement V2 loading logic.
+    Version 2: Persistent staging buffer (1 regmem/deregmem for all files)
+    + selective tensor reading (only DMA needed tensors via read groups).
+    The consumer (default_weight_loader) will copy_ the data into model
+    parameters.
     """
-    raise NotImplementedError(
-        "phxsafetensors_v2 is not yet implemented. "
-        "Please implement PhxLoaderV2 and this function."
-    )
+    device = torch.device(f"cuda:{current_platform.current_device()}")
+    loader = PhxLoaderV2(current_platform.current_device())
+
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
+    # 64K alignment required by phxfs_regmem
+    GPU_PAGE_SIZE = 64 * 1024
+
+    t_start = time.perf_counter()
+    try:
+        # ---- Phase 1: Pre-scan all files to determine buffer size ----
+        file_plans: list = []  # list[FilePlan | None]
+        max_buf_size = 0
+
+        for st_file in sorted_files:
+            tensor_meta, header_size = \
+                parse_safetensor_header_v2(st_file)
+
+            # Filter out skipped weights (EP)
+            needed: dict[str, tuple[torch.dtype, tuple[int, ...], int, int]] = {}
+            for name, meta in tensor_meta.items():
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                needed[name] = meta
+
+            if not needed:
+                file_plans.append(None)
+                continue
+
+            groups = build_read_groups(needed, header_size)
+            plan = build_file_plan(st_file, header_size, groups)
+            file_plans.append(plan)
+
+            if plan.file_buf_size > max_buf_size:
+                max_buf_size = plan.file_buf_size
+
+        t_prescan = time.perf_counter() - t_start
+
+        if max_buf_size == 0:
+            return  # No weights to load
+
+        # ---- Phase 2: Allocate persistent buffer + regmem (once) ----
+        t_reg_start = time.perf_counter()
+        buf_size = (max_buf_size + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1)
+        buf = torch.empty(buf_size, dtype=torch.uint8, device=device)
+        loader.regmem(buf.data_ptr(), buf.numel())
+        t_regmem = time.perf_counter() - t_reg_start
+
+        t_sync_total = 0.0
+        t_dma_total = 0.0
+        file_count = 0
+        try:
+            # ---- Phase 3: Per-file DMA + yield tensor views ----
+            for plan in tqdm(
+                file_plans,
+                desc="Loading safetensors using Phoenix V2 loader",
+                disable=not enable_tqdm(use_tqdm_on_load),
+                bar_format=_BAR_FORMAT,
+            ):
+                if plan is None:
+                    continue
+                file_count += 1
+
+                # Ensure previous file's copy_ is complete before
+                # reusing buffer (DMA would overwrite it)
+                t_sync = time.perf_counter()
+                torch.cuda.synchronize()
+                t_sync_total += time.perf_counter() - t_sync
+
+                # Build batch: [(buf_offset, file_offset, nbytes), ...]
+                batch = [
+                    (plan.slots[i],
+                     plan.groups[i].aligned_f_offset,
+                     plan.groups[i].read_size)
+                    for i in range(len(plan.groups))
+                ]
+
+                # DMA all read groups into buffer (serial phxfs_read)
+                t_dma = time.perf_counter()
+                loader.read_into_registered(
+                    plan.path, buf.data_ptr(), batch)
+                t_dma_total += time.perf_counter() - t_dma
+
+                # Yield zero-copy tensor views from buffer
+                for i, group in enumerate(plan.groups):
+                    slot = plan.slots[i]
+                    for name, (dtype, shape, data_start, nbytes) in (
+                        group.tensors.items()
+                    ):
+                        tensor_f_offset = plan.header_size + data_start
+                        view_offset = (
+                            slot + group.pre_padding
+                            + (tensor_f_offset
+                               - group.first_tensor_f_offset)
+                        )
+                        view = buf[view_offset:view_offset + nbytes
+                                   ].view(dtype).reshape(shape)
+                        yield name, view
+        finally:
+            t_dereg_start = time.perf_counter()
+            loader.deregmem(buf.data_ptr(), buf.numel())
+            t_deregmem = time.perf_counter() - t_dereg_start
+
+            t_total = time.perf_counter() - t_start
+            t_yield = (t_total - t_prescan - t_regmem - t_sync_total
+                       - t_dma_total - t_deregmem)
+            rank = (torch.distributed.get_rank()
+                    if torch.distributed.is_initialized() else 0)
+            logger.info(
+                "Phoenix V2 weight loading timing (rank=%d): "
+                "files=%d prescan=%.3fs regmem=%.3fs "
+                "sync=%.3fs dma=%.3fs yield(copy_)=%.3fs "
+                "deregmem=%.3fs total=%.3fs buf_size=%.1fMB",
+                rank, file_count, t_prescan, t_regmem, t_sync_total,
+                t_dma_total, t_yield, t_deregmem, t_total,
+                buf_size / 1024 / 1024,
+            )
+    finally:
+        loader.close()
 
 
 def _init_fastsafetensors_loader(
