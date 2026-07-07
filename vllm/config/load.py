@@ -54,6 +54,9 @@ class LoadConfig:
       supporting efficient loading of tensor-parallel models.
     - "mistral" will load weights from consolidated safetensors files used by
       Mistral models.
+    - "phxsafetensors" Official Release, Current Version v2.2. It loads the 
+      Safetensors weights using Phoenix GPU Direct Storage V2.2 (phxfs), which 
+      enables DMA-accelerated loading directly from storage to GPU memory.
     - "phxsafetensors_v1" will load the Safetensors weights using Phoenix GPU
       Direct Storage V1 (phxfs), which enables DMA-accelerated loading directly
       from storage to GPU memory.

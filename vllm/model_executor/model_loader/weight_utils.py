@@ -82,6 +82,23 @@ except ImportError:
     build_read_groups = phxloader_v2.placeholder_attr("build_read_groups")
     build_file_plan = phxloader_v2.placeholder_attr("build_file_plan")
 
+# phxloader: official release package (V2.2)
+# Uses aliases to avoid clashing with module-level names from phxloader_v2.
+try:
+    from phxloader import (
+        PhxLoader,
+        parse_safetensor_header as parse_safetensor_header_v22,
+        build_read_groups as build_read_groups_v22,
+        build_file_plan as build_file_plan_v22,
+    )
+except ImportError:
+    phxloader = PlaceholderModule("phxloader")
+    PhxLoader = phxloader.placeholder_attr("PhxLoader")
+    parse_safetensor_header_v22 = phxloader.placeholder_attr(
+        "parse_safetensor_header")
+    build_read_groups_v22 = phxloader.placeholder_attr("build_read_groups")
+    build_file_plan_v22 = phxloader.placeholder_attr("build_file_plan")
+
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 
 logger = init_logger(__name__)
@@ -1546,6 +1563,191 @@ def phoenix_weights_iterator_v2_1(
 
             logger.info(
                 "Phoenix V2.1 double-buffer timing (rank=%d): "
+                "files=%d prescan=%.3fs regmem=%.3fs "
+                "sync=%.3fs submit=%.3fs yield(copy_)=%.3fs "
+                "wait_dma=%.3fs PURE_DMA=%.3fs "
+                "deregmem=%.3fs total=%.3fs buf_size=%.1fMB "
+                "overlap_hidden=%.3fs",
+                rank, file_count, t_prescan, t_regmem,
+                t_sync_total, t_submit_total, t_yield_total,
+                t_wait_total, pure_dma,
+                t_deregmem, t_total, buf_size / 1024 / 1024,
+                overlap_hidden,
+            )
+    finally:
+        loader.close()
+
+
+# ---------------------------------------------------------------------------
+# Phoenix Official Release (GPU Direct Storage via phxfs V2.2) weight loading
+# ---------------------------------------------------------------------------
+
+def phoenix_weights_iterator(
+    hf_weights_files: list[str],
+    use_tqdm_on_load: bool,
+    local_expert_ids: set[int] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """V2.2: Double buffer + async DMA (formal release: phxloader).
+
+    Functionally identical to V2.1. Uses the formal release package ``phxloader``
+    with renamed API (load_tensors_into_buffer / load_tensors_into_buffer_async).
+
+    Uses two alternating GPU buffers (bufA/bufB). While the consumer
+    copy_'s data from buf_curr, the next file's DMA runs in a C++ background
+    thread into buf_next. This overlaps yield(copy_) with DMA.
+
+    Expected benefit: if DMA doesn't slow down under concurrency (which
+    depends on NVMe headroom), the yield time (~2.5-2.8s) is fully hidden,
+    reducing total by ~2.5s.
+    """
+    device = torch.device(f"cuda:{current_platform.current_device()}")
+    loader = PhxLoader(current_platform.current_device())
+
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    rank = (torch.distributed.get_rank()
+            if torch.distributed.is_initialized() else 0)
+
+    GPU_PAGE_SIZE = 64 * 1024
+
+    t_start = time.perf_counter()
+    try:
+        # ---- Phase 1: Pre-scan all files (same as V2) ----
+        file_plans: list = []
+        max_buf_size = 0
+
+        for st_file in sorted_files:
+            tensor_meta, header_size = \
+                parse_safetensor_header_v22(st_file)
+
+            needed: dict[str, tuple[torch.dtype, tuple[int, ...], int, int]] = {}
+            for name, meta in tensor_meta.items():
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                needed[name] = meta
+            if not needed:
+                file_plans.append(None)
+                continue
+            groups = build_read_groups_v22(needed, header_size)
+
+            plan = build_file_plan_v22(st_file, header_size, groups)
+            file_plans.append(plan)
+
+            if plan.file_buf_size > max_buf_size:
+                max_buf_size = plan.file_buf_size
+
+        t_prescan = time.perf_counter() - t_start
+
+        if max_buf_size == 0:
+            return  # No weights to load
+
+        # ---- Phase 2: Allocate 2 buffers + regmem both ----
+        t_reg_start = time.perf_counter()
+        buf_size = (max_buf_size + GPU_PAGE_SIZE - 1) & ~(GPU_PAGE_SIZE - 1)
+        bufA = torch.empty(buf_size, dtype=torch.uint8, device=device)
+        bufB = torch.empty(buf_size, dtype=torch.uint8, device=device)
+        loader.regmem(bufA.data_ptr(), bufA.numel())
+        loader.regmem(bufB.data_ptr(), bufB.numel())
+        t_regmem = time.perf_counter() - t_reg_start
+
+        # Pre-compute batches for all valid files
+        valid_plans = [(i, p) for i, p in enumerate(file_plans) if p is not None]
+        n_valid = len(valid_plans)
+        batches = []
+        for _, plan in valid_plans:
+            batches.append([
+                (plan.slots[i],
+                 plan.groups[i].aligned_f_offset,
+                 plan.groups[i].read_size)
+                for i in range(len(plan.groups))
+            ])
+
+        # ---- Phase 3: Double buffer DMA + yield ----
+        loader.reset_dma_timer()
+
+        t_sync_total = 0.0
+        t_submit_total = 0.0
+        t_yield_total = 0.0
+        t_wait_total = 0.0
+        file_count = 0
+
+        buffers = [bufA, bufB]
+        buf_idx = 0  # current buffer index
+
+        try:
+            # Pre-submit first file's DMA → bufA
+            first_plan = valid_plans[0][1]
+            first_batch = batches[0]
+            t_submit = time.perf_counter()
+            loader.load_tensors_into_buffer_async(
+                first_plan.path, buffers[buf_idx].data_ptr(), first_batch)
+            t_submit_total += time.perf_counter() - t_submit
+
+            for vi, (_, plan) in enumerate(
+                tqdm(valid_plans,
+                     desc="Loading safetensors using Phoenix Official Release (V2.2) loader",
+                     disable=not enable_tqdm(use_tqdm_on_load),
+                     bar_format=_BAR_FORMAT)
+            ):
+                file_count += 1
+                buf_curr = buffers[buf_idx]
+                buf_next = buffers[1 - buf_idx]
+
+                # Wait for current file's DMA to complete
+                t_wait = time.perf_counter()
+                loader.wait_dma()
+                t_wait_total += time.perf_counter() - t_wait
+
+                # Submit next file's DMA → buf_next (if not last)
+                if vi < n_valid - 1:
+                    next_plan = valid_plans[vi + 1][1]
+                    next_batch = batches[vi + 1]
+                    # Ensure previous copy_ from buf_next is done
+                    t_sync = time.perf_counter()
+                    torch.cuda.synchronize()
+                    t_sync_total += time.perf_counter() - t_sync
+                    # Submit async DMA (returns immediately)
+                    t_submit = time.perf_counter()
+                    loader.load_tensors_into_buffer_async(
+                        next_plan.path, buf_next.data_ptr(), next_batch)
+                    t_submit_total += time.perf_counter() - t_submit
+
+                # Yield views from current buffer.
+                # Consumer's copy_ overlaps with the background DMA for
+                # the next file.
+                t_yield_start = time.perf_counter()
+                for i, group in enumerate(plan.groups):
+                    slot = plan.slots[i]
+                    for name, (dtype, shape, data_start, nbytes) in (
+                        group.tensors.items()
+                    ):
+                        tensor_f_offset = plan.header_size + data_start
+                        view_offset = (
+                            slot + group.pre_padding
+                            + (tensor_f_offset
+                               - group.first_tensor_f_offset)
+                        )
+                        view = _phx_make_view(
+                            buf_curr, view_offset, nbytes, dtype, shape)
+                        t_tensor_start = time.perf_counter()
+                        yield name, view
+                t_yield_total += time.perf_counter() - t_yield_start
+
+                buf_idx = 1 - buf_idx  # swap buffers
+        finally:
+            t_dereg_start = time.perf_counter()
+            loader.deregmem(bufA.data_ptr(), bufA.numel())
+            loader.deregmem(bufB.data_ptr(), bufB.numel())
+            t_deregmem = time.perf_counter() - t_dereg_start
+
+            pure_dma = loader.get_dma_seconds()
+            t_total = time.perf_counter() - t_start
+            # overlap_hidden: how much DMA ran concurrently with yield.
+            # = PURE_DMA - wait_dma (wait_dma is the time DMA was NOT
+            # overlapping with yield, i.e., we were blocked waiting for it)
+            overlap_hidden = pure_dma - t_wait_total
+
+            logger.info(
+                "Phoenix Official Release (V2.2) double-buffer timing (rank=%d): "
                 "files=%d prescan=%.3fs regmem=%.3fs "
                 "sync=%.3fs submit=%.3fs yield(copy_)=%.3fs "
                 "wait_dma=%.3fs PURE_DMA=%.3fs "
