@@ -1417,21 +1417,15 @@ def phoenix_weights_iterator_v2_1(
             tensor_meta, header_size = \
                 parse_safetensor_header_v2(st_file)
 
-            if local_expert_ids is None:
-                groups = build_read_groups(tensor_meta, header_size)
-                if not groups:
-                    file_plans.append(None)
+            needed: dict[str, tuple[torch.dtype, tuple[int, ...], int, int]] = {}
+            for name, meta in tensor_meta.items():
+                if should_skip_weight(name, local_expert_ids):
                     continue
-            else:
-                needed: dict[str, tuple[torch.dtype, tuple[int, ...], int, int]] = {}
-                for name, meta in tensor_meta.items():
-                    if should_skip_weight(name, local_expert_ids):
-                        continue
-                    needed[name] = meta
-                if not needed:
-                    file_plans.append(None)
-                    continue
-                groups = build_read_groups(needed, header_size)
+                needed[name] = meta
+            if not needed:
+                file_plans.append(None)
+                continue
+            groups = build_read_groups(needed, header_size)
 
             plan = build_file_plan(st_file, header_size, groups)
             file_plans.append(plan)
@@ -1473,8 +1467,6 @@ def phoenix_weights_iterator_v2_1(
         t_yield_total = 0.0
         t_wait_total = 0.0
         file_count = 0
-        per_tensor_times: list[float] = []
-        per_tensor_sizes: list[int] = []
 
         buffers = [bufA, bufB]
         buf_idx = 0  # current buffer index
@@ -1535,10 +1527,7 @@ def phoenix_weights_iterator_v2_1(
                         view = _phx_make_view(
                             buf_curr, view_offset, nbytes, dtype, shape)
                         t_tensor_start = time.perf_counter()
-                        yield name, view
-                        per_tensor_times.append(
-                            time.perf_counter() - t_tensor_start)
-                        per_tensor_sizes.append(nbytes)
+                        yield name, view                        
                 t_yield_total += time.perf_counter() - t_yield_start
 
                 buf_idx = 1 - buf_idx  # swap buffers
@@ -1568,35 +1557,6 @@ def phoenix_weights_iterator_v2_1(
                 t_deregmem, t_total, buf_size / 1024 / 1024,
                 overlap_hidden,
             )
-
-            if per_tensor_times:
-                import statistics as _stat
-                n = len(per_tensor_times)
-                avg_ms = _stat.mean(per_tensor_times) * 1000
-                max_ms = max(per_tensor_times) * 1000
-                min_ms = min(per_tensor_times) * 1000
-                small = [t for t, s in zip(per_tensor_times,
-                         per_tensor_sizes) if s < 1048576]
-                med = [t for t, s in zip(per_tensor_times,
-                       per_tensor_sizes)
-                       if 1048576 <= s < 10485760]
-                big = [t for t, s in zip(per_tensor_times,
-                       per_tensor_sizes) if s >= 10485760]
-                logger.info(
-                    "Phoenix V2.1 per-tensor yield stats (rank=%d): "
-                    "n=%d yield_total=%.3fs avg=%.2fms min=%.2fms "
-                    "max=%.2fms | <1MB:%d avg=%.2fms | 1-10MB:%d "
-                    "avg=%.2fms | >=10MB:%d avg=%.2fms",
-                    rank, n, sum(per_tensor_times), avg_ms, min_ms,
-                    max_ms,
-                    len(small),
-                    _stat.mean(small) * 1000 if small else 0,
-                    len(med),
-                    _stat.mean(med) * 1000 if med else 0,
-                    len(big),
-                    _stat.mean(big) * 1000 if big else 0,
-                )
-                
     finally:
         loader.close()
 
