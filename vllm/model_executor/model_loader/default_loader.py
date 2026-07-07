@@ -33,6 +33,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     np_cache_weights_iterator,
     phoenix_weights_iterator_v1,
     phoenix_weights_iterator_v2,
+    phoenix_weights_iterator_v2_1,
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -172,6 +173,7 @@ class DefaultModelLoader(BaseModelLoader):
             or load_format == "fastsafetensors"
             or load_format == "phxsafetensors_v1"
             or load_format == "phxsafetensors_v2"
+            or load_format == "phxsafetensors_v2_1"
             or load_format == "instanttensor"
         ):
             use_safetensors = True
@@ -281,6 +283,12 @@ class DefaultModelLoader(BaseModelLoader):
                 )
             elif self.load_config.load_format == "phxsafetensors_v2":
                 weights_iterator = phoenix_weights_iterator_v2(
+                    hf_weights_files,
+                    self.load_config.use_tqdm_on_load,
+                    local_expert_ids=self.local_expert_ids,
+                )
+            elif self.load_config.load_format == "phxsafetensors_v2_1":
+                weights_iterator = phoenix_weights_iterator_v2_1(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
                     local_expert_ids=self.local_expert_ids,

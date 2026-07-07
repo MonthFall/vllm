@@ -60,6 +60,8 @@ class LoadConfig:
     - "phxsafetensors_v2" will load the Safetensors weights using Phoenix GPU
       Direct Storage V2 (phxfs), which enables DMA-accelerated loading directly
       from storage to GPU memory.
+    - "phxsafetensors_v2_1" will load using Phoenix V2.1 double-buffer + async
+      DMA, overlapping yield(copy_) with background DMA for reduced load time.
     - "modelexpress" will load weights using ModelExpress.
     - Other custom values can be supported via plugins.
     """
